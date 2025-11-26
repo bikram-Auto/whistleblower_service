@@ -1,4 +1,6 @@
 # compiled output
+/sender
+/consumer
 /.vscode
 /dist
 /node_modules
