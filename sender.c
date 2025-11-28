@@ -1,7 +1,37 @@
-// sender_server.c  (NEW VERSION)
-// Sender is now a TCP SERVER that Business Service connects to.
-// It listens on BUSINESS_PORT (from .env), handles TCP client commands,
-// sends UDP to consumer, receives replies, and sends DELIVERED over TCP.
+// sender.c
+// UDP receiver from Consumer → TCP hub for Target Users
+//
+// Build:
+//   gcc -Wall -O2 -o sender sender.c
+//
+// Run:
+//   ./sender <user_tcp_port> <listen_udp_port>
+//
+// Protocol:
+//
+// Target User → Sender (TCP):
+//   1) Connect to TCP <user_tcp_port>
+//   2) Send: "HELLO <userId>\n"
+//      - On success: Sender replies "OK\n"
+//      - If anything sent before HELLO: "ERROR HELLO_REQUIRED\n"
+//      - If HELLO sent twice: "ERROR ALREADY_IDENTIFIED\n"
+//      - If another connection already uses same userId:
+//            "ERROR USER_ALREADY_CONNECTED\n" (and new conn is closed)
+//   3) After HELLO, Target User only receives:
+//         "FROM <senderId> <x_time> <message>\n"
+//      Any further data they send → "ERROR READ_ONLY\n"
+//
+// Consumer → Sender (UDP):
+//   Payload:  "msgId|senderId|toUserId|x_time|message"
+//   Behaviour:
+//     - If toUserId is connected:
+//         - Send over TCP to that user:
+//             "FROM senderId x_time message\n"
+//         - Reply UDP: "msgId|OK|delivered"
+//     - If not connected:
+//         - Reply UDP: "msgId|NOT_CONNECTED|Target offline"
+//
+// NOTE: HMAC is intentionally disabled for testing; to be added later.
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -13,162 +43,435 @@
 #include <arpa/inet.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
-#include <netdb.h>
-#include <openssl/hmac.h>
-#include "env.h"
 
 #define MAX_EVENTS 128
-#define BUFSZ 8192
-#define HMAC_HEX_LEN (EVP_MAX_MD_SIZE*2)
+#define BUFSZ      8192
 
-static int make_nonblocking(int fd) {
+#define MAX_USERS   10000
+#define INBUF_SIZE  1024
+
+struct User {
+    int   fd;
+    char  userId[64];
+    int   identified;              // 0 = not yet HELLO, 1 = HELLO done
+    char  inbuf[INBUF_SIZE];
+    size_t inbuf_len;
+};
+
+static struct User users[MAX_USERS];
+
+// ---------- small helpers ----------
+
+static int make_nonblock(int fd) {
     int f = fcntl(fd, F_GETFL, 0);
+    if (f == -1) return -1;
     return fcntl(fd, F_SETFL, f | O_NONBLOCK);
 }
 
-static int hmac_sha256_hex(const char *k, const char *d, char *out, size_t osz) {
-    unsigned int len = 0;
-    unsigned char *r = HMAC(EVP_sha256(), k, strlen(k),
-                            (unsigned char*)d, strlen(d), NULL, &len);
-    if (!r || osz < len*2+1) return -1;
-    for (unsigned i=0; i<len; i++) sprintf(out + i*2, "%02x", r[i]);
-    out[len*2] = 0;
-    return 0;
+static struct User* alloc_user(int fd) {
+    for (int i = 0; i < MAX_USERS; i++) {
+        if (users[i].fd == 0) {
+            users[i].fd = fd;
+            users[i].userId[0] = '\0';
+            users[i].identified = 0;
+            users[i].inbuf_len = 0;
+            return &users[i];
+        }
+    }
+    return NULL;
 }
 
-static void strtrim(char *s) {
-    while (*s==' '||*s=='\t'||*s=='\r') s++;
-    size_t l = strlen(s);
-    while (l && (s[l-1]==' '||s[l-1]=='\t'||s[l-1]=='\r')) s[--l]=0;
+// Find by fd
+static struct User* find_user_by_fd(int fd) {
+    for (int i = 0; i < MAX_USERS; i++) {
+        if (users[i].fd == fd) return &users[i];
+    }
+    return NULL;
 }
 
-int main() {
-    load_env_file(".env");
+// Find by userId
+static struct User* find_user_by_id(const char *uid) {
+    if (!uid || !*uid) return NULL;
+    for (int i = 0; i < MAX_USERS; i++) {
+        if (users[i].fd != 0 && users[i].identified &&
+            strcmp(users[i].userId, uid) == 0) {
+            return &users[i];
+        }
+    }
+    return NULL;
+}
 
-    const char *SECRET = get_env_value("SECRET_KEY");
-    const char *SENDER_ID = get_env_value("SENDER_ID");
-    const char *BUS_HOST = get_env_value("BUSINESS_HOST");
-    const char *BUS_PORT_S = get_env_value("BUSINESS_PORT");
-    const char *CONS_PORT_S = get_env_value("CONSUMER_PORT");
+static void free_user(struct User *u) {
+    if (!u) return;
+    if (u->fd > 0) close(u->fd);
+    u->fd = 0;
+    u->userId[0] = '\0';
+    u->identified = 0;
+    u->inbuf_len = 0;
+}
 
-    if (!SECRET || !SENDER_ID) {
-        fprintf(stderr, "Missing SECRET or SENDER_ID\n");
+// ---------- TCP protocol handling for target users ----------
+
+static void handle_hello(struct User *u, const char *line) {
+    // line is a single line without newline: e.g. "HELLO 123456789"
+    if (!u) return;
+
+    // If already identified
+    if (u->identified) {
+        // Duplicate HELLO
+        const char *msg = "ERROR ALREADY_IDENTIFIED\n";
+        send(u->fd, msg, strlen(msg), 0);
+        printf("[sender] fd=%d tried HELLO again (userId=%s)\n",
+               u->fd, u->userId);
+        return;
+    }
+
+    char cmd[16] = {0};
+    char uid[64] = {0};
+
+    int n = sscanf(line, "%15s %63s", cmd, uid);
+    if (n < 2 || strcmp(cmd, "HELLO") != 0) {
+        const char *msg = "ERROR HELLO_REQUIRED\n";
+        send(u->fd, msg, strlen(msg), 0);
+        printf("[sender] fd=%d sent non-HELLO before identifying\n", u->fd);
+        return;
+    }
+
+    // Check if this userId is already in use
+    struct User *existing = find_user_by_id(uid);
+    if (existing) {
+        const char *msg = "ERROR USER_ALREADY_CONNECTED\n";
+        send(u->fd, msg, strlen(msg), 0);
+        printf("[sender] fd=%d tried HELLO with already-used userId=%s; rejecting\n",
+               u->fd, uid);
+        // Close this NEW connection
+        free_user(u);
+        return;
+    }
+
+    // Assign userId and mark identified
+    strncpy(u->userId, uid, sizeof(u->userId)-1);
+    u->userId[sizeof(u->userId)-1] = '\0';
+    u->identified = 1;
+
+    const char *ok = "OK\n";
+    send(u->fd, ok, strlen(ok), 0);
+
+    printf("[sender] fd=%d registered as userId=%s\n", u->fd, u->userId);
+}
+
+static void handle_user_readable(struct User *u) {
+    if (!u) return;
+    char buf[BUFSZ];
+    int r = recv(u->fd, buf, sizeof(buf) - 1, 0);
+    if (r <= 0) {
+        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return;
+        printf("[sender] user fd=%d disconnected\n", u->fd);
+        free_user(u);
+        return;
+    }
+    buf[r] = '\0';
+
+    // Append to per-user buffer
+    if (u->inbuf_len + (size_t)r >= INBUF_SIZE) {
+        // Overflow → reset buffer, send error if not yet identified
+        u->inbuf_len = 0;
+        if (!u->identified) {
+            const char *msg = "ERROR HELLO_REQUIRED\n";
+            send(u->fd, msg, strlen(msg), 0);
+        } else {
+            const char *msg = "ERROR READ_ONLY\n";
+            send(u->fd, msg, strlen(msg), 0);
+        }
+        return;
+    }
+
+    memcpy(u->inbuf + u->inbuf_len, buf, (size_t)r);
+    u->inbuf_len += (size_t)r;
+
+    // Process complete lines
+    size_t start = 0;
+    for (size_t i = 0; i < u->inbuf_len; i++) {
+        if (u->inbuf[i] == '\n') {
+            u->inbuf[i] = '\0';
+            char *line = u->inbuf + start;
+
+            if (!u->identified) {
+                // First valid line must be HELLO
+                handle_hello(u, line);
+                // if handle_hello closed user, u->fd == 0, break
+                if (u->fd == 0) {
+                    u->inbuf_len = 0;
+                    return;
+                }
+            } else {
+                // After HELLO, user should not send commands
+                const char *msg = "ERROR READ_ONLY\n";
+                send(u->fd, msg, strlen(msg), 0);
+                printf("[sender] userId=%s fd=%d sent unexpected data after HELLO: '%s'\n",
+                       u->userId, u->fd, line);
+            }
+
+            start = i + 1;
+        }
+    }
+
+    // Move leftover (partial line) to front
+    if (start < u->inbuf_len) {
+        memmove(u->inbuf, u->inbuf + start, u->inbuf_len - start);
+        u->inbuf_len -= start;
+    } else {
+        u->inbuf_len = 0;
+    }
+}
+
+// ---------- UDP handling (from Consumer) ----------
+
+static void handle_udp_readable(int udp_fd) {
+    char b[BUFSZ];
+    struct sockaddr_in src;
+    socklen_t sl = sizeof(src);
+
+    int r = recvfrom(udp_fd, b, sizeof(b) - 1, 0,
+                     (struct sockaddr*)&src, &sl);
+    if (r <= 0) {
+        return;
+    }
+    b[r] = '\0';
+
+    // Expected format:
+    //   msgId|senderId|toUserId|x_time|message
+    char msgId[64]     = {0};
+    char senderId[128] = {0};
+    char toUserId[128] = {0};
+    char xtime[128]    = {0};
+    char message[4096] = {0};
+
+    int n = sscanf(b, "%63[^|]|%127[^|]|%127[^|]|%127[^|]|%4095[^\n]",
+                   msgId, senderId, toUserId, xtime, message);
+    if (n < 5) {
+        fprintf(stderr, "[sender] bad UDP payload: '%s'\n", b);
+        // Could reply with error if msgId known; for now just ignore
+        return;
+    }
+
+    printf("[sender] UDP msgId=%s senderId=%s toUserId=%s x_time=%s message='%s'\n",
+           msgId, senderId, toUserId, xtime, message);
+
+    struct User *target = find_user_by_id(toUserId);
+    char reply[BUFSZ];
+
+    if (!target) {
+        // Target not connected
+        snprintf(reply, sizeof(reply),
+                 "%s|NOT_CONNECTED|Target offline", msgId);
+        sendto(udp_fd, reply, strlen(reply), 0,
+               (struct sockaddr*)&src, sl);
+
+        printf("[sender] toUserId=%s is offline -> NOT_CONNECTED\n", toUserId);
+        return;
+    }
+
+    // Target is connected → send message over TCP
+    char line[BUFSZ];
+    snprintf(line, sizeof(line),
+             "FROM %s %s %s\n", senderId, xtime, message);
+
+    ssize_t sent = send(target->fd, line, strlen(line), 0);
+    if (sent < 0) {
+        perror("[sender] send to target user failed");
+        snprintf(reply, sizeof(reply),
+                 "%s|ERROR|send_failed", msgId);
+        sendto(udp_fd, reply, strlen(reply), 0,
+               (struct sockaddr*)&src, sl);
+        return;
+    }
+
+    printf("[sender] delivered to userId=%s fd=%d\n",
+           target->userId, target->fd);
+
+    // Acknowledge to Consumer
+    snprintf(reply, sizeof(reply),
+             "%s|OK|delivered", msgId);
+    sendto(udp_fd, reply, strlen(reply), 0,
+           (struct sockaddr*)&src, sl);
+}
+
+// ---------- main ----------
+
+int main(int argc, char **argv) {
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <user_tcp_port> <listen_udp_port>\n", argv[0]);
         return 1;
     }
 
-    int listen_port = BUS_PORT_S ? atoi(BUS_PORT_S) : 7000;
-    int consumer_port = CONS_PORT_S ? atoi(CONS_PORT_S) : 6000;
+    int tcp_port = atoi(argv[1]);
+    int udp_port = atoi(argv[2]);
 
-    printf("Sender TCP server starting on *:%d\n", listen_port);
-    printf("Consumer: 127.0.0.1:%d\n", consumer_port);
+    memset(users, 0, sizeof(users));
 
-    // UDP socket
+    // ----- UDP socket (from Consumer) -----
     int udp = socket(AF_INET, SOCK_DGRAM, 0);
-    make_nonblocking(udp);
+    if (udp < 0) {
+        perror("socket udp");
+        return 1;
+    }
 
-    struct sockaddr_in consumer;
-    memset(&consumer,0,sizeof(consumer));
-    consumer.sin_family = AF_INET;
-    inet_pton(AF_INET, "127.0.0.1", &consumer.sin_addr);
-    consumer.sin_port = htons(consumer_port);
+    struct sockaddr_in uaddr;
+    memset(&uaddr, 0, sizeof(uaddr));
+    uaddr.sin_family      = AF_INET;
+    uaddr.sin_addr.s_addr = INADDR_ANY;
+    uaddr.sin_port        = htons(udp_port);
 
-    // TCP listening socket
+    if (bind(udp, (struct sockaddr*)&uaddr, sizeof(uaddr)) < 0) {
+        perror("bind udp");
+        close(udp);
+        return 1;
+    }
+    if (make_nonblock(udp) < 0) {
+        perror("fcntl udp");
+        close(udp);
+        return 1;
+    }
+
+    // ----- TCP server for target users -----
     int srv = socket(AF_INET, SOCK_STREAM, 0);
-    int yes = 1; setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    if (srv < 0) {
+        perror("socket tcp");
+        close(udp);
+        return 1;
+    }
 
-    struct sockaddr_in addr;
-    memset(&addr,0,sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(listen_port);
+    int yes = 1;
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
-    bind(srv, (struct sockaddr*)&addr, sizeof(addr));
-    listen(srv, 16);
-    make_nonblocking(srv);
+    struct sockaddr_in taddr;
+    memset(&taddr, 0, sizeof(taddr));
+    taddr.sin_family      = AF_INET;
+    taddr.sin_addr.s_addr = INADDR_ANY;
+    taddr.sin_port        = htons(tcp_port);
 
+    if (bind(srv, (struct sockaddr*)&taddr, sizeof(taddr)) < 0) {
+        perror("bind tcp");
+        close(srv);
+        close(udp);
+        return 1;
+    }
+    if (listen(srv, 64) < 0) {
+        perror("listen");
+        close(srv);
+        close(udp);
+        return 1;
+    }
+    if (make_nonblock(srv) < 0) {
+        perror("fcntl srv");
+        close(srv);
+        close(udp);
+        return 1;
+    }
+
+    // ----- epoll -----
     int ep = epoll_create1(0);
+    if (ep < 0) {
+        perror("epoll_create1");
+        close(srv);
+        close(udp);
+        return 1;
+    }
 
     struct epoll_event ev;
-    ev.events = EPOLLIN; ev.data.fd = srv;
-    epoll_ctl(ep, EPOLL_CTL_ADD, srv, &ev);
+    ev.events  = EPOLLIN;
+    ev.data.fd = srv;
+    if (epoll_ctl(ep, EPOLL_CTL_ADD, srv, &ev) < 0) {
+        perror("epoll_ctl srv");
+        close(ep);
+        close(srv);
+        close(udp);
+        return 1;
+    }
 
-    ev.events = EPOLLIN; ev.data.fd = udp;
-    epoll_ctl(ep, EPOLL_CTL_ADD, udp, &ev);
+    ev.events  = EPOLLIN;
+    ev.data.fd = udp;
+    if (epoll_ctl(ep, EPOLL_CTL_ADD, udp, &ev) < 0) {
+        perror("epoll_ctl udp");
+        close(ep);
+        close(srv);
+        close(udp);
+        return 1;
+    }
 
-    printf("Sender ready. Waiting for Business Service TCP connection...\n");
+    printf("[sender] ready. TCP(port=%d) for target users, UDP(port=%d) from consumer\n",
+           tcp_port, udp_port);
 
     struct epoll_event events[MAX_EVENTS];
-    char buf[BUFSZ];
-
-    int client = -1;
 
     for (;;) {
         int n = epoll_wait(ep, events, MAX_EVENTS, -1);
-        for (int i=0;i<n;i++) {
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            perror("epoll_wait");
+            break;
+        }
+
+        for (int i = 0; i < n; i++) {
             int fd = events[i].data.fd;
 
-            // NEW CLIENT CONNECTS
             if (fd == srv) {
-                client = accept(srv, NULL, NULL);
-                if (client >= 0) {
-                    make_nonblocking(client);
-                    ev.events = EPOLLIN;
-                    ev.data.fd = client;
-                    epoll_ctl(ep, EPOLL_CTL_ADD, client, &ev);
-                    printf("Business connected (fd=%d)\n", client);
-                }
-                continue;
-            }
-
-            // UDP REPLY
-            if (fd == udp) {
-                struct sockaddr_in src;
-                socklen_t sl = sizeof(src);
-            
-                int r = recvfrom(udp, buf, sizeof(buf)-1, 0, (void*)&src, &sl);
-                if (r > 0 && client >= 0) {
-                    buf[r] = 0;
-            
-                    char line[BUFSZ];
-                    snprintf(line, sizeof(line), "DELIVERED %s %s\n", SENDER_ID, buf);
-                    send(client, line, strlen(line), 0);
-                }
-                continue;
-            }
-            
-            // TCP COMMAND FROM BUSINESS
-            if (fd == client) {
-                int r = recv(client, buf, sizeof(buf)-1, 0);
-                if (r <= 0) {
-                    printf("Business disconnected.\n");
-                    close(client);
-                    client=-1;
+                // New TCP target user
+                int c = accept(srv, NULL, NULL);
+                if (c < 0) {
+                    perror("accept");
                     continue;
                 }
-                buf[r]=0;
-
-                // Expect: SEND <receiver> <message>
-                char receiver[256]={0};
-                char message[4096]={0};
-
-                if (sscanf(buf, "SEND %255s %4095[^\n]", receiver, message)==2) {
-                    printf("SEND %s: %s\n", receiver, message);
-
-                    // Build UDP payload
-                    char data[BUFSZ];
-                    snprintf(data, sizeof(data), "%s:%s:%s", SENDER_ID, receiver, message);
-
-                    char hex[HMAC_HEX_LEN+1];
-                    hmac_sha256_hex(SECRET, data, hex, sizeof(hex));
-
-                    char payload[BUFSZ];
-                    snprintf(payload, sizeof(payload), "%s:%s:%s:%s",
-                             SENDER_ID, receiver, message, hex);
-
-                    sendto(udp, payload, strlen(payload), 0,
-                           (void*)&consumer, sizeof(consumer));
+                if (make_nonblock(c) < 0) {
+                    perror("fcntl client");
+                    close(c);
+                    continue;
                 }
+
+                struct User *u = alloc_user(c);
+                if (!u) {
+                    fprintf(stderr, "[sender] max users reached, closing new client\n");
+                    close(c);
+                    continue;
+                }
+
+                struct epoll_event cev;
+                cev.events  = EPOLLIN;
+                cev.data.fd = c;
+                if (epoll_ctl(ep, EPOLL_CTL_ADD, c, &cev) < 0) {
+                    perror("epoll_ctl client");
+                    free_user(u);
+                    continue;
+                }
+
+                printf("[sender] new TCP target connection fd=%d\n", c);
+                continue;
             }
+
+            if (fd == udp) {
+                // UDP from Consumer
+                handle_udp_readable(udp);
+                continue;
+            }
+
+            // Otherwise: TCP data from a known user
+            struct User *u = find_user_by_fd(fd);
+            if (!u) {
+                // Unknown fd (shouldn't happen)
+                char tmp[256];
+                int r = recv(fd, tmp, sizeof(tmp), 0);
+                if (r <= 0) close(fd);
+                continue;
+            }
+
+            handle_user_readable(u);
         }
     }
+
+    close(ep);
+    close(srv);
+    close(udp);
+    return 0;
 }
