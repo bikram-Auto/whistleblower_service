@@ -1,48 +1,63 @@
+# Whistleblower Messaging Service (Prototype)
 
+```
+[Producer User]
+        │  TCP (JSON)
+        ▼
+┌──────────────────┐
+│    Consumer       │
+│  (TCP + UDP out)  │
+└──────────────────┘
+        │  UDP
+        ▼
+┌──────────────────┐
+│     Sender        │
+│  (UDP in + TCP)   │
+└──────────────────┘
+        │  TCP (text lines)
+        ▼
+[Target User]
+```
 
-                       (UDP — ultra-fast internal messages)
-   ┌─────────────┐                                   ┌──────────────┐
-   │   Sender     │  <------------UDP------------->  │   Consumer   │
-   │ (C Program)  │                                  │ (C Program)  │
-   └──────┬──────┘                                   └──────┬───────┘
-          |                                                 ^
-          | TCP (reliable)                                  │
-          v                                                 │
-   ┌──────────────────┐                             ┌──────────────────┐
-   │ Business Service  │                            │ Business Service │
-   │ (NestJS / C / Go) │                            │ (NestJS / C / Go)│
-   └──────────────────┘                             └──────────────────┘
+## Overview
 
+This system provides fast, reliable, bidirectional messaging using:
 
+- **TCP** for user connections  
+- **UDP** for internal service-to-service relay  
+- **Non-blocking sockets + epoll** for high concurrency  
 
+## Flow
 
+1. Producer user connects to **Consumer** via TCP  
+2. Consumer forwards messages to **Sender** via UDP  
+3. Sender delivers messages to the **Target User** via TCP  
+4. Sender replies to Consumer over UDP  
+5. Consumer responds to Producer via TCP  
 
-1. UDP CHANNEL → ONLY for Sender ↔ Consumer
-	- Fastest possible transport
-	- No handshake
-	- Very low bandwidth
-	- Best for internal "relay" messages
-	- No need for reliability (your business service handles that through TCP)
+## Running
 
+### Start Sender:
+```
+./sender 7001 6001
+```
 
+### Start Consumer:
+```
+./consumer 7000 6001
+```
 
-Sender sends:
-	`sender_id:receiver_id:message:hmac`
+## Testing
 
-Consumer replies:
-	`sender_id:message:new_hmac`
+### Target User:
+```
+nc 127.0.0.1 7001
+HELLO 5678
+```
 
-
-
-* Both use:
-	Non-blocking UDP sockets
-	epoll() for 10k+ clients
-	HMAC for security
-	.env secret key
-
-
-
-
-
-
-
+### Producer User:
+```
+nc 127.0.0.1 7000
+HELLO 1234
+{"senderId":"1234","toUserId":"5678","message":"hello","x_time":"now"}
+```
