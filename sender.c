@@ -2,36 +2,17 @@
 // UDP receiver from Consumer → TCP hub for Target Users
 //
 // Build:
-//   gcc -Wall -O2 -o sender sender.c
+//   gcc -Wall -O2 -o sender sender.c env.c
 //
-// Run:
+// Run (CLI overrides env):
 //   ./sender <user_tcp_port> <listen_udp_port>
+//   or with .env only:
+//   ./sender
 //
-// Protocol:
-//
-// Target User → Sender (TCP):
-//   1) Connect to TCP <user_tcp_port>
-//   2) Send: "HELLO <userId>\n"
-//      - On success: Sender replies "OK\n"
-//      - If anything sent before HELLO: "ERROR HELLO_REQUIRED\n"
-//      - If HELLO sent twice: "ERROR ALREADY_IDENTIFIED\n"
-//      - If another connection already uses same userId:
-//            "ERROR USER_ALREADY_CONNECTED\n" (and new conn is closed)
-//   3) After HELLO, Target User only receives:
-//         "FROM <senderId> <x_time> <message>\n"
-//      Any further data they send → "ERROR READ_ONLY\n"
-//
-// Consumer → Sender (UDP):
-//   Payload:  "msgId|senderId|toUserId|x_time|message"
-//   Behaviour:
-//     - If toUserId is connected:
-//         - Send over TCP to that user:
-//             "FROM senderId x_time message\n"
-//         - Reply UDP: "msgId|OK|delivered"
-//     - If not connected:
-//         - Reply UDP: "msgId|NOT_CONNECTED|Target offline"
-//
-// NOTE: HMAC is intentionally disabled for testing; to be added later.
+// .env variables:
+//   SECRET_KEY   = MYKEY123456      (loaded, reserved for future HMAC)
+//   UDP_PORT     = 6000             (sender listens on this UDP port)
+//   SENDER_PORT  = 3031             (TCP port for target users)
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -43,6 +24,8 @@
 #include <arpa/inet.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+
+#include "env.h"   // <--- added
 
 #define MAX_EVENTS 128
 #define BUFSZ      8192
@@ -265,7 +248,7 @@ static void handle_udp_readable(int udp_fd) {
     if (!target) {
         // Target not connected
         snprintf(reply, sizeof(reply),
-                 "%s|NOT_CONNECTED|Target offline", msgId);
+                 "%s|NOT_CONNECTED|Target user not connected", msgId);
         sendto(udp_fd, reply, strlen(reply), 0,
                (struct sockaddr*)&src, sl);
 
@@ -301,13 +284,34 @@ static void handle_udp_readable(int udp_fd) {
 // ---------- main ----------
 
 int main(int argc, char **argv) {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <user_tcp_port> <listen_udp_port>\n", argv[0]);
-        return 1;
+    // ---- load .env ----
+    load_env_file(".env");
+
+    const char *secret = get_env_value("SECRET_KEY");
+    const char *env_sender_port = get_env_value("SENDER_PORT");
+    const char *env_udp_port    = get_env_value("UDP_PORT");
+
+    if (!secret) {
+        fprintf(stderr, "[sender] WARNING: SECRET_KEY not set in .env (HMAC disabled for now)\n");
     }
 
-    int tcp_port = atoi(argv[1]);
-    int udp_port = atoi(argv[2]);
+    int tcp_port = 0;
+    int udp_port = 0;
+
+    if (argc >= 3) {
+        tcp_port = atoi(argv[1]);
+        udp_port = atoi(argv[2]);
+    } else {
+        if (!env_sender_port || !env_udp_port) {
+            fprintf(stderr,
+                    "Usage: %s <user_tcp_port> <listen_udp_port>\n"
+                    "Or set SENDER_PORT and UDP_PORT in .env\n",
+                    argv[0]);
+            return 1;
+        }
+        tcp_port = atoi(env_sender_port);
+        udp_port = atoi(env_udp_port);
+    }
 
     memset(users, 0, sizeof(users));
 
